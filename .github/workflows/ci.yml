@@ -1,0 +1,83 @@
+# CI pipeline for sample-ai-app. Chapter 11 (docs/11-production-and-enterprise.md) has a fuller,
+# line-by-line annotated pipeline covering the same ideas; this one is the runnable version for this repo.
+# GitHub only reads workflows from <repo-root>/.github/workflows/, which is why this lives here.
+name: ci
+
+on:
+  pull_request:
+    paths: ["sample-ai-app/**"]
+  push:
+    branches: [main]
+    paths: ["sample-ai-app/**"]
+    tags: ["v*.*.*"]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ai-chat-api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # The Dockerfile's `test` stage runs pytest during the build; the build fails if tests fail.
+      - name: Run unit tests inside Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: sample-ai-app
+          target: test
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-scan-push:
+    needs: test
+    if: github.event_name == 'push'          # don't publish images from pull requests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                        # allows pushing to GitHub Container Registry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # auto-provided, no secret to create
+      - id: meta                              # computes tags like sha-abc1234, 1.2.3, latest
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build (loaded locally so we can scan before pushing)
+        uses: docker/build-push-action@v6
+        with:
+          context: sample-ai-app
+          target: runtime
+          load: true
+          tags: scan-me:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Vulnerability scan (fail on HIGH/CRITICAL that have a fix)
+        # Pinned to a full commit SHA (= v0.35.0), not a tag. In March 2026 attackers rewrote
+        # most trivy-action tags to malicious commits; a SHA cannot be silently moved.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: scan-me:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: sample-ai-app
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
